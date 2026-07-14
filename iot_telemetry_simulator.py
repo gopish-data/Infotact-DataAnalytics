@@ -92,8 +92,12 @@ class ContainerSensor:
         value += random.uniform(-step, step)
         return round(max(low, min(high, value)), 3)
 
-    def _advance_journey(self, interval_seconds):
-        km_this_tick = self.speed_kmph * (interval_seconds / 3600)
+    def _advance_journey(self, sim_minutes_per_tick):
+        # Journey progress is driven by SIMULATED time per reading, not real
+        # wall-clock time. This lets a fleet realistically complete a
+        # 2000+ km route within a reasonable number of readings, instead of
+        # requiring the script to run for real days.
+        km_this_tick = self.speed_kmph * (sim_minutes_per_tick / 60)
         self.distance_remaining_km = max(0.0, round(self.distance_remaining_km - km_this_tick, 2))
 
     def _update_stress(self):
@@ -133,22 +137,34 @@ class ContainerSensor:
 
         return risk, action, alert
 
-    def read(self, interval_seconds=1.0):
+    def read(self, interval_seconds=1.0, sim_minutes_per_tick=5.0):
         # Sensor fluctuation
         self.humidity = self._random_walk(self.humidity, 0.4, 70, 95)
-        self.vibration = self._random_walk(self.vibration, 0.02, 0.0, 0.6)
 
         if self.is_drifting:
-            # Simulates a failing cooling unit -> temperature creeps out of range
+            # Simulates a failing cooling unit -> temperature creeps toward
+            # ambient temperature, capped at a physically realistic maximum
+            # (a container can't get hotter than the surrounding environment
+            # just from a cooling failure).
+            AMBIENT_MAX_C = 38.0
             self.temperature += self.drift_rate + random.uniform(-0.01, 0.02)
-            self.temperature = round(self.temperature, 3)
+            self.temperature = round(min(self.temperature, AMBIENT_MAX_C), 3)
+            # Normal small vibration noise, plus occasional rough-handling spikes
+            self.vibration = self._random_walk(self.vibration, 0.02, 0.0, 0.3)
             if random.random() < 0.05:
                 self.vibration = round(self.vibration + random.uniform(0.3, 0.8), 3)
         else:
+            # Healthy container: temperature stays within the cargo's ideal
+            # range (tight bound, no artificial buffer) so it doesn't
+            # falsely accumulate spoilage stress over a long journey.
             low, high = IDEAL_TEMP_RANGE[self.cargo_type]
-            self.temperature = self._random_walk(self.temperature, 0.15, low - 1, high + 1)
+            self.temperature = self._random_walk(self.temperature, 0.1, low, high)
+            # Low, capped vibration noise — well below the 0.5 warning
+            # threshold, so healthy containers don't randomly drift into
+            # Medium/High risk purely from long-run vibration noise.
+            self.vibration = self._random_walk(self.vibration, 0.015, 0.0, 0.25)
 
-        self._advance_journey(interval_seconds)
+        self._advance_journey(sim_minutes_per_tick)
         self._update_stress()
         risk, action, alert = self._derive_status()
 
@@ -168,14 +184,17 @@ class ContainerSensor:
         }
 
 
-def build_fleet(num_containers=5):
-    """Creates a fleet of containers. One is randomly chosen to 'drift' (spoilage risk).
+def build_fleet(num_containers=5, num_drifting=1):
+    """Creates a fleet of containers. `num_drifting` of them are randomly chosen
+    to 'drift' into high spoilage risk (simulating a failing cooling unit);
+    the rest stay healthy for the full journey.
 
     Cargo assignment guarantees every cargo type in CARGO_TYPES appears at least
     once (as long as num_containers >= number of cargo types) instead of relying
     on pure random.choice, which can easily skip some types on small fleets.
     """
-    drifting_index = random.randint(0, num_containers - 1)
+    num_drifting = max(0, min(num_drifting, num_containers))
+    drifting_indices = set(random.sample(range(num_containers), num_drifting))
 
     # Build a list of cargo assignments: one guaranteed pass through every
     # cargo type first (shuffled), then fill any remaining slots randomly.
@@ -197,7 +216,7 @@ def build_fleet(num_containers=5):
             ContainerSensor(
                 container_id=container_id,
                 cargo_type=cargo,
-                is_drifting=(i == drifting_index),
+                is_drifting=(i in drifting_indices),
             )
         )
     return fleet
@@ -249,17 +268,36 @@ def build_kafka_producer(bootstrap_servers="localhost:9092"):
 def main():
     parser = argparse.ArgumentParser(description="AtmoSync real-time IoT telemetry simulator")
     parser.add_argument("--containers", type=int, default=5, help="Number of containers to simulate")
+    parser.add_argument("--drifting", type=int, default=1,
+                         help="Number of containers that develop a spoilage-risk drift "
+                              "(failing cooling unit) during the run")
     parser.add_argument("--interval", type=float, default=1.0, help="Seconds between readings")
     parser.add_argument("--out", type=str, default=None, help="Optional .jsonl file to append readings to")
     parser.add_argument("--csv", type=str, default=None, help="Optional .csv file to append readings to (opens as a table in Excel)")
     parser.add_argument("--kafka", action="store_true", help="Also stream readings into a Kafka topic")
     parser.add_argument("--bootstrap-server", type=str, default="localhost:9092", help="Kafka bootstrap server")
     parser.add_argument("--topic", type=str, default="container-telemetry", help="Kafka topic name")
+    parser.add_argument("--rows", type=int, default=None,
+                         help="Stop automatically after generating this many total readings")
+    parser.add_argument("--sim-minutes-per-tick", type=float, default=None,
+                         help="Simulated minutes of travel time per reading (controls how fast "
+                              "Distance_Remaining_km decreases, independent of --interval). "
+                              "If not set, auto-calculated from --rows so the journey finishes "
+                              "right around the last reading (avoids 'stuck at 0 km' padding).")
     args = parser.parse_args()
 
-    fleet = build_fleet(args.containers)
+    AVG_SPEED_KMPH = 55  # matches the midpoint of each container's random speed range
+    if args.sim_minutes_per_tick is None:
+        if args.rows and args.containers:
+            expected_ticks_per_container = max(1, args.rows / args.containers)
+            args.sim_minutes_per_tick = (ROUTE_DISTANCE_KM / AVG_SPEED_KMPH) * 60 / expected_ticks_per_container
+        else:
+            args.sim_minutes_per_tick = 5.0
+
+    fleet = build_fleet(args.containers, num_drifting=args.drifting)
+    row_target_msg = f", stopping after {args.rows} rows" if args.rows else ""
     print(f"# Simulating {len(fleet)} containers on route {ORIGIN} -> {DESTINATION} "
-          f"({ROUTE_DISTANCE_KM} km). Press Ctrl+C to stop.\n")
+          f"({ROUTE_DISTANCE_KM} km){row_target_msg}. Press Ctrl+C to stop.\n")
 
     producer = None
     if args.kafka:
@@ -267,16 +305,21 @@ def main():
         producer = build_kafka_producer(args.bootstrap_server)
         print(f"# Connected. Streaming into topic '{args.topic}'.\n")
 
+    rows_written = 0
     try:
         while True:
             for sensor in fleet:
-                reading = sensor.read(interval_seconds=args.interval)
+                reading = sensor.read(interval_seconds=args.interval,
+                                       sim_minutes_per_tick=args.sim_minutes_per_tick)
                 emit(reading, args.out, csv_file=args.csv, producer=producer, topic=args.topic)
+                rows_written += 1
+                if args.rows and rows_written >= args.rows:
+                    raise KeyboardInterrupt
             time.sleep(args.interval)
             if producer:
                 producer.flush()
     except KeyboardInterrupt:
-        print("\n# Simulation stopped.")
+        print(f"\n# Simulation stopped. {rows_written} rows generated.")
         if producer:
             producer.flush()
             producer.close()
